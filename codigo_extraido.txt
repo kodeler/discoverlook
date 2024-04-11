@@ -1,0 +1,1910 @@
+// Archivo: /home/user/linkeep/next.config.js
+/** @type {import('next').NextConfig} */
+const nextConfig = {
+  images: {
+    remotePatterns: [
+      {
+        hostname: '*.googleusercontent.com'
+      },
+      {
+        hostname: 'linkeep.s3.amazonaws.com',
+      },
+    ],
+  }
+}
+
+module.exports = nextConfig
+
+
+// Archivo: /home/user/linkeep/postcss.config.js
+module.exports = {
+  plugins: {
+    tailwindcss: {},
+    autoprefixer: {},
+  },
+}
+
+
+// Archivo: /home/user/linkeep/src/actions/grabUsername.js
+'use server';
+import {authOptions} from "@/app/api/auth/[...nextauth]/route";
+import {Page} from "@/models/Page";
+import mongoose from "mongoose";
+import {getServerSession} from "next-auth";
+
+export default async function grabUsername(formData) {
+  const username = formData.get('username');
+  mongoose.connect(process.env.MONGO_URI);
+  const existingPageDoc = await Page.findOne({uri:username});
+  if (existingPageDoc) {
+    return false;
+  } else {
+    const session = await getServerSession(authOptions);
+    return await Page.create({
+      uri:username,
+      owner:session?.user?.email,
+    });
+  }
+}
+
+// Archivo: /home/user/linkeep/src/actions/pageActions.js
+'use server';
+import {authOptions} from "@/app/api/auth/[...nextauth]/route";
+import {Page} from "@/models/Page";
+import {User} from "@/models/User";
+import mongoose from "mongoose";
+import {getServerSession} from "next-auth";
+
+export async function savePageSettings(formData) {
+  mongoose.connect(process.env.MONGO_URI);
+  const session = await getServerSession(authOptions);
+  if (session) {
+    const dataKeys = [
+      'displayName','location',
+      'bio', 'bgType', 'bgColor', 'bgImage',
+    ];
+
+    const dataToUpdate = {};
+    for (const key of dataKeys) {
+      if (formData.has(key)) {
+        dataToUpdate[key] = formData.get(key);
+      }
+    }
+
+    await Page.updateOne(
+      {owner:session?.user?.email},
+      dataToUpdate,
+    );
+
+    if (formData.has('avatar')) {
+      const avatarLink = formData.get('avatar');
+      await User.updateOne(
+        {email: session.user?.email},
+        {image: avatarLink},
+      );
+    }
+
+    return true;
+  }
+
+  return false;
+}
+
+export async function savePageButtons(formData) {
+  mongoose.connect(process.env.MONGO_URI);
+  const session = await getServerSession(authOptions);
+  if (session) {
+    const buttonsValues = {};
+    formData.forEach((value, key) => {
+      buttonsValues[key] = value;
+    });
+    const dataToUpdate = {buttons:buttonsValues};
+    await Page.updateOne(
+      {owner:session?.user?.email},
+      dataToUpdate,
+    );
+    return true;
+  }
+  return false;
+}
+
+export async function savePageLinks(links) {
+  mongoose.connect(process.env.MONGO_URI);
+  const session = await getServerSession(authOptions);
+  if (session) {
+    await Page.updateOne(
+      {owner:session?.user?.email},
+      {links},
+    );
+  } else {
+    return false;
+  }
+}
+
+// Archivo: /home/user/linkeep/src/app/(app)/account/page.js
+import {authOptions} from "@/app/api/auth/[...nextauth]/route";
+import PageSettingsForm from "@/components/forms/PageSettingsForm";
+import PageButtonsForm from "@/components/forms/PageButtonsForm";
+import PageLinksForm from "@/components/forms/PageLinksForm";
+import UsernameForm from "@/components/forms/UsernameForm";
+import {Page} from "@/models/Page";
+import mongoose from "mongoose";
+import {getServerSession, redirect} from "next-auth";
+import cloneDeep from 'clone-deep';
+
+export default async function AccountPage({searchParams}) {
+  const session = await getServerSession(authOptions);
+  const desiredUsername = searchParams?.desiredUsername;
+  if (!session) {
+    return redirect('/');
+  }
+  mongoose.connect(process.env.MONGO_URI);
+  const page = await Page.findOne({owner: session?.user?.email});
+
+  // Verifica si el objeto page no es null antes de continuar
+  if (page) {
+    const leanPage = cloneDeep(page.toJSON());
+    leanPage._id = leanPage._id.toString();
+    return (
+      <>
+        <PageSettingsForm page={leanPage} user={session.user} />
+        <PageButtonsForm page={leanPage} user={session.user} />
+        <PageLinksForm page={leanPage} user={session.user} />
+      </>
+    );
+  } else {
+    // Maneja el caso cuando page es null
+    return (
+      <div>
+        <UsernameForm desiredUsername={desiredUsername} />
+      </div>
+    );
+  }
+}
+
+
+// Archivo: /home/user/linkeep/src/app/(app)/analytics/page.js
+import {authOptions} from "@/app/api/auth/[...nextauth]/route";
+import Chart from "@/components/Chart";
+import SectionBox from "@/components/layout/SectionBox";
+import {Event} from "@/models/Event";
+import {Page} from "@/models/Page";
+import {faLink} from "@fortawesome/free-solid-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+import {differenceInDays, formatISO9075, isToday} from "date-fns";
+import mongoose from "mongoose";
+import {getServerSession} from "next-auth";
+import {redirect} from "next/navigation";
+import {CartesianGrid, Legend, Line, LineChart, Tooltip, XAxis, YAxis} from "recharts";
+
+
+export default async function AnalyticsPage() {
+  mongoose.connect(process.env.MONGO_URI);
+  const session = await getServerSession(authOptions);
+  if (!session) {
+    return redirect('/');
+  }
+  const page = await Page.findOne({owner: session.user.email});
+
+  const groupedViews = await Event.aggregate([
+    {
+      $match: {
+        type: 'view',
+        uri: page.uri,
+      }
+    },
+    {
+      $group: {
+        _id: {
+          $dateToString: {
+            date: "$createdAt",
+            format: "%Y-%m-%d"
+          },
+        },
+        count: {
+          "$count": {},
+        }
+      },
+    },
+    {
+      $sort: {_id: 1}
+    }
+  ]);
+
+  const clicks = await Event.find({
+    page: page.uri,
+    type: 'click',
+  });
+
+  return (
+    <div>
+      <SectionBox>
+        <h2 className="text-xl mb-6 text-center">Views</h2>
+        <Chart data={groupedViews.map(o => ({
+          'date': o._id,
+          'views': o.count,
+        }))} />
+      </SectionBox>
+      <SectionBox>
+        <h2 className="text-xl mb-6 text-center">Clicks</h2>
+        {page.links.map(link => (
+          <div key={link.title} className="md:flex gap-4 items-center border-t border-gray-200 py-4">
+            <div className="text-blue-500 pl-4">
+              <FontAwesomeIcon icon={faLink} />
+            </div>
+            <div className="grow">
+              <h3>{link.title || 'no title'}</h3>
+              <p className="text-gray-700 text-sm">{link.subtitle || 'no description'}</p>
+              <a className="text-xs text-blue-400" target="_blank" href="link.url">{link.url}</a>
+            </div>
+            <div className="text-center">
+              <div className="border rounded-md p-2 mt-1 md:mt-0">
+                <div className="text-3xl">
+                  {
+                    clicks
+                      .filter(
+                        c => c.uri === link.url
+                          && isToday(c.createdAt)
+                      )
+                      .length
+                  }
+                </div>
+                <div className="text-gray-400 text-xs uppercase font-bold">clicks today</div>
+              </div>
+            </div>
+            <div className="text-center">
+              <div className="border rounded-md p-2 mt-1 md:mt-0">
+                <div className="text-3xl">
+                  {clicks.filter(c => c.uri === link.url).length}
+                </div>
+                <div className="text-gray-400 text-xs uppercase font-bold">clicks total</div>
+              </div>
+            </div>
+          </div>
+        ))}
+      </SectionBox>
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/app/(app)/layout.js
+export const metadata = {
+  title: 'Linkeep',
+  description: 'Generated by Linkeep',
+}
+
+export default function RootLayout({ children }) {
+ return (
+    <html lang="en">
+      <body>{children}</body>
+    </html>
+  )
+}
+
+
+// Archivo: /home/user/linkeep/src/app/(app)/pay/page.js
+// app/(app)/pay/page.js (or any other page)
+import { getServerSession } from 'next-auth';
+import { authOptions } from '@/app/api/auth/[...nextauth]/route';
+import PaymentComponent from '@/components/PaymentComponent/PaymentComponent';
+import mongoose from 'mongoose';
+import {User} from "@/models/User";
+
+export default async function PayPage() {
+  const session = await getServerSession(authOptions);
+  mongoose.connect(process.env.MONGO_URI);
+  const user = await User.findOne({ email: session?.user?.email });
+  const userId = user.id;
+// Suggested code may be subject to a license. Learn more: ~LicenseLog:3043002697.
+  console.log(">>+++++>>>>>>>------>>>>>>>>>>>>>>>>", userId);
+
+  return <PaymentComponent userId={userId} />;
+}
+
+// Archivo: /home/user/linkeep/src/app/(app)/template.js
+import {authOptions} from "@/app/api/auth/[...nextauth]/route";
+import AppSidebar from "@/components/layout/AppSidebar";
+import {Page} from "@/models/Page";
+import {faBars, faLink} from "@fortawesome/free-solid-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+import mongoose from "mongoose";
+import {getServerSession} from "next-auth";
+import {Lato} from 'next/font/google'
+import '../globals.css'
+import {headers} from "next/headers";
+import Image from "next/image";
+import Link from "next/link";
+import {redirect} from "next/navigation";
+import {Toaster} from "react-hot-toast";
+
+const lato = Lato({ subsets: ['latin'], weight: ['400','700'] })
+
+export const metadata = {
+  title: 'Create Next App',
+  description: 'Generated by create next app',
+}
+
+export default async function AppTemplate({ children, ...rest }) {
+  const headersList = headers();
+  const session = await getServerSession(authOptions);
+  if (!session) {
+    return redirect('/');
+  }
+  mongoose.connect(process.env.MONGO_URI);
+  const page = await Page.findOne({owner: session.user.email});
+  return (
+    <html lang="en">
+    <body className={lato.className}>
+    <Toaster />
+    <main className="md:flex min-h-screen">
+      <label htmlFor="navCb" className="md:hidden ml-8 mt-4 p-4 rounded-md bg-white shadow inline-flex items-center gap-2 cursor-pointer">
+        <FontAwesomeIcon icon={faBars} />
+        <span>Open navigation</span>
+      </label>
+      <input id="navCb" type="checkbox" className="hidden" />
+      <label htmlFor="navCb" className="hidden backdrop fixed inset-0 bg-black/80 z-10"></label>
+      <aside className="bg-white w-48 p-4 pt-6 shadow fixed md:static -left-48 top-0 bottom-0 z-20 transition-all">
+        <div className="sticky top-0 pt-2">
+          <div className="rounded-full overflow-hidden aspect-square w-24 mx-auto">
+            <Image src={session.user.image} width={256} height={256} alt={'avatar'} />
+          </div>
+          {page && (
+            <Link
+              target="_blank"
+              href={'/'+page.uri}
+              className="text-center mt-4 flex gap-1 items-center justify-center">
+              <FontAwesomeIcon size="lg" icon={faLink} className="text-blue-500" />
+              <span className="text-xl text-gray-300">/</span>
+              <span>{page.uri}</span>
+            </Link>
+          )}
+          <div className="text-center">
+            <AppSidebar />
+          </div>
+        </div>
+      </aside>
+      <div className="grow">
+        {children}
+      </div>
+    </main>
+    </body>
+    </html>
+  )
+}
+
+
+// Archivo: /home/user/linkeep/src/app/(page)/[uri]/layout.js
+import Header from "@/components/Header";
+import {Lato} from 'next/font/google'
+import '../../globals.css'
+
+const lato = Lato({ subsets: ['latin'], weight: ['400', '700'] })
+
+export const metadata = {
+  title: 'Create Next App',
+  description: 'Generated by create next app',
+}
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+    <body className={lato.className}>
+    <main>
+      {children}
+    </main>
+    </body>
+    </html>
+  )
+}
+
+
+// Archivo: /home/user/linkeep/src/app/(page)/[uri]/page.js
+import {Page} from "@/models/Page";
+import {User} from "@/models/User";
+import {Event} from "@/models/Event";
+import {
+  faDiscord,
+  faFacebook,
+  faGithub,
+  faInstagram, faTelegram,
+  faTiktok,
+  faWhatsapp,
+  faYoutube
+} from "@fortawesome/free-brands-svg-icons";
+import {faEnvelope, faLink, faLocationDot, faMobile, faPhone} from "@fortawesome/free-solid-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+import mongoose from "mongoose";
+import {btoa} from "next/dist/compiled/@edge-runtime/primitives";
+import Image from "next/image";
+import Link from "next/link";
+
+export const buttonsIcons = {
+  email: faEnvelope,
+  mobile: faPhone,
+  instagram: faInstagram,
+  facebook: faFacebook,
+  discord: faDiscord,
+  tiktok: faTiktok,
+  youtube: faYoutube,
+  whatsapp: faWhatsapp,
+  github: faGithub,
+  telegram: faTelegram,
+};
+
+function buttonLink(key, value) {
+  if (key === 'mobile') {
+    return 'tel:'+value;
+  }
+  if (key === 'email') {
+    return 'mailto:'+value;
+  }
+  return value;
+}
+
+export default async function UserPage({params}) {
+  const uri = params.uri;
+  mongoose.connect(process.env.MONGO_URI);
+  const page = await Page.findOne({uri});
+  
+  // Verifica si el objeto page no es null antes de continuar
+  if (!page) {
+    // Puedes manejar el error como prefieras aquí, por ejemplo, devolver una página de error o redireccionar
+    return <div>Page not found</div>;
+  }
+  
+  const user = await User.findOne({email: page.owner});
+  
+  // Asumiendo que quieres manejar también si user es null
+  if (!user) {
+    // Manejo cuando el usuario no se encuentra, similar a como manejas page
+    return <div>User not found</div>;
+  }
+  await Event.create({uri:uri, page:uri, type:'view'});
+  return (
+    <div className="bg-blue-950 text-white min-h-screen">
+      <div
+        className="h-36 bg-gray-400 bg-cover bg-center"
+        style={
+          page.bgType === 'color'
+            ? {backgroundColor:page.bgColor}
+            : {backgroundImage:`url(${page.bgImage})`}
+        }
+      >
+      </div>
+      <div className="aspect-square w-36 h-36 mx-auto relative -top-16 -mb-12">
+        <Image
+          className="rounded-full w-full h-full object-cover"
+          src={user.image}
+          alt="avatar"
+          width={256} height={256}
+        />
+      </div>
+      <h2 className="text-2xl text-center mb-1">{page.displayName}</h2>
+      <h3 className="text-md flex gap-2 justify-center items-center text-white/70">
+        <FontAwesomeIcon className="h-4" icon={faLocationDot} />
+        <span>
+          {page.location}
+        </span>
+      </h3>
+      <div className="max-w-xs mx-auto text-center my-2">
+        <p>{page.bio}</p>
+      </div>
+      <div className="flex gap-2 justify-center mt-4 pb-4">
+        {Object.keys(page.buttons).map(buttonKey => (
+          <Link key={buttonKey} href={buttonLink(buttonKey, page.buttons[buttonKey])}
+                className="rounded-full bg-white text-blue-950 p-2 flex items-center justify-center">
+            <FontAwesomeIcon className="w-5 h-5" icon={buttonsIcons[buttonKey]} />
+          </Link>
+        ))}
+      </div>
+      <div className="max-w-2xl mx-auto grid md:grid-cols-2 gap-6 p-4 px-8">
+        {page.links.map(link => (
+          <Link
+            key={link.url}
+            target="_blank"
+            ping={process.env.URL+'api/click?url='+ btoa(link.url)+'&page='+page.uri}
+            className="bg-indigo-800 p-2 block flex"
+            href={link.url}>
+            <div className="relative -left-4 overflow-hidden w-16">
+              <div className="w-16 h-16 bg-blue-700 aspect-square relative flex items-center justify-center aspect-square">
+                {link.icon && (
+                  <Image
+                    className="w-full h-full object-cover"
+                    src={link.icon}
+                    alt={'icon'} width={64} height={64} />
+                )}
+                {!link.icon && (
+                  <FontAwesomeIcon icon={faLink} className="w-8 h-8" />
+                )}
+              </div>
+            </div>
+            <div className="flex items-center justify-center shrink grow-0 overflow-hidden">
+              <div>
+                <h3>{link.title}</h3>
+                <p className="text-white/50 h-6 overflow-hidden">{link.subtitle}</p>
+              </div>
+            </div>
+          </Link>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/app/(website)/contact/page.js
+// src/pages/contact.jsx
+'use client';
+import { useState } from 'react';
+
+export default function Contact() {
+  const [formData, setFormData] = useState({
+    name: '',
+    email: '',
+    message: '',
+  });
+
+  const handleChange = (e) => {
+    const { name, value } = e.target;
+    setFormData(prevState => ({
+      ...prevState,
+      [name]: value,
+    }));
+  };
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    // Aquí puedes agregar la lógica para enviar los datos del formulario,
+    // por ejemplo, usando fetch() para enviar los datos a una API.
+    console.log('Form data:', formData);
+
+    // Resetea el formulario después del envío
+    setFormData({
+      name: '',
+      email: '',
+      message: '',
+    });
+  };
+
+  return (
+    <div className="container mx-auto px-4">
+      <h1 className="text-xl font-semibold text-center my-4">Contact Us</h1>
+      <form onSubmit={handleSubmit} className="max-w-md mx-auto">
+        <div className="mb-4">
+          <label htmlFor="name" className="block text-sm font-medium text-gray-700">Name</label>
+          <input
+            type="text"
+            name="name"
+            id="name"
+            value={formData.name}
+            onChange={handleChange}
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+            required
+          />
+        </div>
+        <div className="mb-4">
+          <label htmlFor="email" className="block text-sm font-medium text-gray-700">Email</label>
+          <input
+            type="email"
+            name="email"
+            id="email"
+            value={formData.email}
+            onChange={handleChange}
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+            required
+          />
+        </div>
+        <div className="mb-4">
+          <label htmlFor="message" className="block text-sm font-medium text-gray-700">Message</label>
+          <textarea
+            name="message"
+            id="message"
+            value={formData.message}
+            onChange={handleChange}
+            rows="4"
+            className="mt-1 block w-full rounded-md border-gray-300 shadow-sm focus:border-indigo-500 focus:ring-indigo-500"
+            required
+          ></textarea>
+        </div>
+        <div className="text-center">
+          <button
+            type="submit"
+            className="inline-flex justify-center py-2 px-4 border border-transparent shadow-sm text-sm font-medium rounded-md text-white bg-indigo-600 hover:bg-indigo-700 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-indigo-500"
+          >
+            Send Message
+          </button>
+        </div>
+      </form>
+    </div>
+  );
+}
+
+
+// Archivo: /home/user/linkeep/src/app/(website)/layout.js
+import Header from "@/components/Header";
+import {Lato} from 'next/font/google'
+import '../globals.css'
+
+const lato = Lato({ subsets: ['latin'], weight: ['400', '700'] })
+
+export const metadata = {
+  title: 'Create Next App',
+  description: 'Generated by create next app',
+}
+
+export default function RootLayout({ children }) {
+  return (
+    <html lang="en">
+      <body className={lato.className}>
+        <main>
+          <Header />
+          <div className="max-w-4xl mx-auto p-6">
+            {children}
+          </div>
+        </main>
+      </body>
+    </html>
+  )
+}
+
+
+// Archivo: /home/user/linkeep/src/app/(website)/login/page.js
+import LoginWithGoogle from "@/components/buttons/LoginWithGoogle";
+
+export default function LoginPage() {
+  return (
+    <div>
+      <div className="p-4 max-w-xs mx-auto">
+        <h1 className="text-4xl font-bold text-center mb-2">
+          Sign In
+        </h1>
+        <p className="text-center mb-6 text-gray-500">
+          Sign in to your account using one of the methods below
+        </p>
+        <LoginWithGoogle />
+      </div>
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/app/(website)/page.js
+import {authOptions} from "@/app/api/auth/[...nextauth]/route";
+import HeroForm from "@/components/forms/HeroForm";
+import {getServerSession} from "next-auth";
+
+export default async function Home() {
+  const session = await getServerSession(authOptions);
+  return (
+    <main>
+      <section className="pt-32">
+        <div className="max-w-md mb-8">
+          <h1 className="text-6xl font-bold">
+            Your one link<br />for everything
+          </h1>
+          <h2 className="text-gray-500 text-xl mt-6">
+            Share your links, social profiles, contact info and more on one page
+          </h2>
+        </div>
+        <HeroForm user={session?.user} />
+      </section>
+    </main>
+  )
+}
+
+
+// Archivo: /home/user/linkeep/src/app/(website)/signup/page.js
+import LoginWithGoogle from "@/components/buttons/LoginWithGoogle";
+
+export default function LoginPage() {
+  return (
+    <div>
+      <div className="p-4 max-w-xs mx-auto">
+        <h1 className="text-4xl font-bold text-center mb-2">
+          Sign Up
+        </h1>
+        <p className="text-center mb-6 text-gray-500">
+          Sign Up to your account using one of the methods below
+        </p>
+        <LoginWithGoogle />
+      </div>
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/app/api/auth/[...nextauth]/route.js
+import clientPromise from "@/libs/mongoClient";
+import {MongoDBAdapter} from "@auth/mongodb-adapter";
+import NextAuth from "next-auth";
+import GoogleProvider from "next-auth/providers/google";
+
+export const authOptions = {
+  secret: process.env.SECRET,
+  adapter: MongoDBAdapter(clientPromise),
+  providers: [
+    GoogleProvider({
+      clientId: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET
+    })
+  ],
+};
+
+const handler = NextAuth(authOptions)
+
+export { handler as GET, handler as POST }
+
+// Archivo: /home/user/linkeep/src/app/api/checkout/route.js
+
+
+// Archivo: /home/user/linkeep/src/app/api/click/route.js
+import {Event} from '@/models/Event';
+import mongoose from "mongoose";
+export async function POST(req) {
+  mongoose.connect(process.env.MONGO_URI);
+  const url = new URL(req.url);
+  const clickedLink = atob(url.searchParams.get('url'));
+  const page = url.searchParams.get('page');
+  await Event.create({type:'click', uri: clickedLink, page});
+  return Response.json(true);
+}
+
+// Archivo: /home/user/linkeep/src/app/api/credits/route.js
+// app/api/credits/route.js
+import paypal from '@paypal/checkout-server-sdk';
+import { NextResponse } from 'next/server';
+import mongoose from 'mongoose';
+
+const creditSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  amount: { type: Number, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+
+const Credit = mongoose.models.Credit || mongoose.model('Credit', creditSchema);
+
+// Creating an environment
+let clientId = process.env.PAYPAL_CLIENT_ID;
+let clientSecret = process.env.PAYPAL_CLIENT_SECRET;
+let environment = new paypal.core.SandboxEnvironment(clientId, clientSecret);
+let client = new paypal.core.PayPalHttpClient(environment);
+
+export async function POST(req) {
+  await mongoose.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  });
+
+  const { amount, userId } = await req.json(); // Extrae tanto amount como userId del cuerpo de la solicitud
+  console.log(">>>>>>>>>>>>>>>endpoint>>>>>>",userId);
+  // Asegúrate de validar el userId aquí, como verificar que no esté vacío
+  if (!userId) {
+    return new Response('User ID is required', { status: 400 });
+  }
+
+  let request = new paypal.orders.OrdersCreateRequest();
+  request.requestBody({
+    intent: 'CAPTURE',
+    purchase_units: [
+      {
+        amount: {
+          currency_code: 'USD',
+          value: amount.toString(),
+        },
+      },
+    ],
+  });
+
+  try {
+    const response = await client.execute(request);
+
+    const credit = new Credit({
+      userId: new mongoose.Types.ObjectId(userId), // Asegúrate de que es un ObjectId válido
+      amount: amount * 100, // Suponiendo que deseas almacenar los créditos como un valor entero
+    });
+    await credit.save();
+
+    return NextResponse.json({ id: response.result.id });
+  } catch (error) {
+    console.error(error);
+    return new Response('Error processing payment', { status: 500 });
+  } finally {
+    await mongoose.disconnect();
+  }
+}
+
+
+export async function GET(req) {
+  await mongoose.connect(process.env.MONGO_URI, {
+    useNewUrlParser: true,
+    useUnifiedTopology: true,
+  });
+
+  const userId = req.query.userId; // Obtiene el userId de los parámetros de la consulta
+
+  // Valida el userId aquí
+  if (!userId) {
+    return new Response('User ID is required', { status: 400 });
+  }
+
+  try {
+    const credits = await Credit.aggregate([
+      { $match: { userId: new mongoose.Types.ObjectId(userId) } },
+      { $group: { _id: null, total: { $sum: '$amount' } } },
+    ]);
+
+    const totalCredits = credits.length > 0 ? credits[0].total : 0;
+
+    return new Response(JSON.stringify({ credits: totalCredits }), {
+      status: 200,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+  } catch (error) {
+    console.error(error);
+    return new Response('Error retrieving credits', { status: 500 });
+  } finally {
+    await mongoose.disconnect();
+  }
+}
+
+
+// Archivo: /home/user/linkeep/src/app/api/hello/route.js
+// pages/api/hello.js
+
+export default function handler(req, res) {
+    if (req.method === 'GET') {
+      // Manejar la solicitud GET
+      res.status(200).json({ message: 'Hello from Next.js API!' });
+    } else if (req.method === 'POST') {
+      // Manejar la solicitud POST
+      res.status(200).json({ message: 'POST request received!' });
+    } else {
+      // Manejar otros tipos de solicitudes
+      res.status(405).json({ message: 'Method Not Allowed' });
+    }
+  }
+  
+
+// Archivo: /home/user/linkeep/src/app/api/upload/route.js
+import {PutObjectCommand, S3Client} from "@aws-sdk/client-s3";
+import uniqid from "uniqid";
+
+export async function POST(req) {
+  const formData = await req.formData();
+
+  if (formData.has('file')) {
+    const file = formData.get('file');
+
+    const s3Client = new S3Client({
+      region: 'us-east-1',
+      credentials: {
+        accessKeyId: process.env.S3_ACCESS_KEY,
+        secretAccessKey: process.env.S3_SECRET_ACCESS_KEY,
+      },
+    });
+
+    const randomId = uniqid();
+    const ext = file.name.split('.').pop();
+    const newFilename = randomId + '.' + ext;
+    const bucketName = process.env.S3_BUCKET_NAME;
+
+    const chunks = [];
+    for await (const chunk of file.stream()) {
+      chunks.push(chunk);
+    }
+
+    await s3Client.send(new PutObjectCommand({
+      Bucket: bucketName,
+      Key: newFilename,
+      ACL: 'public-read',
+      Body: Buffer.concat(chunks),
+      ContentType: file.type,
+    }));
+
+    const link = `https://${bucketName}.s3.amazonaws.com/${newFilename}`;
+
+    return Response.json(link);
+
+  }
+}
+
+// Archivo: /home/user/linkeep/src/components/Chart.js
+'use client';
+
+import {addDays, differenceInDays, formatISO9075, parseISO} from "date-fns";
+import {CartesianGrid, Legend, Line, LineChart, ResponsiveContainer, Tooltip, XAxis, YAxis} from "recharts";
+
+
+export default function Chart({data}) {
+  const xLabelKey = Object.keys(data[0]).find(key => key !== 'date');
+
+  const dataWithoutGaps = [];
+  data.forEach((value, index) => {
+    const date = value.date;
+    dataWithoutGaps.push({
+      date,
+      [xLabelKey]: value?.[xLabelKey] || 0,
+    });
+    const nextDate = data?.[index + 1]?.date;
+    if (date && nextDate) {
+      const daysBetween = differenceInDays(
+        parseISO(nextDate),
+        parseISO(date)
+      );
+      if (daysBetween > 0) {
+        for (let i = 1; i < daysBetween; i++) {
+          const dateBetween = formatISO9075(
+            addDays(parseISO(date), i)
+          ).split(' ')[0];
+          dataWithoutGaps.push({
+            date: dateBetween,
+            [xLabelKey]: 0,
+          })
+        }
+      }
+    }
+  });
+
+  return (
+    <div>
+      <ResponsiveContainer width="100%" height={200}>
+        <LineChart width={730} height={250} data={dataWithoutGaps}
+                   margin={{ top: 5, right: 30, left: 20, bottom: 5 }}>
+          <CartesianGrid horizontal={false} strokeWidth="2" stroke="#f5f5f5" />
+          <XAxis dataKey="date" axisLine={false} tickLine={false} tickMargin={10} tick={{fill:'#aaa'}} />
+          <YAxis axisLine={false} tickLine={false} tickMargin={10} tick={{fill:'#aaa'}} />
+          <Tooltip />
+          <Line
+            type="monotone" dataKey={xLabelKey} stroke="#09f" strokeWidth="4" />
+        </LineChart>
+      </ResponsiveContainer>
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/Header.js
+import {authOptions} from "@/app/api/auth/[...nextauth]/route";
+import LogoutButton from "@/components/buttons/LogoutButton";
+import {getServerSession} from "next-auth";
+import Image from 'next/image'; // Importa Image de next/image
+import Link from "next/link";
+
+export default async function Header() {
+  const session = await getServerSession(authOptions);
+  return (
+    <header className="bg-white border-b py-4">
+      <div className="max-w-4xl flex justify-between mx-auto px-6">
+        <div className="flex items-center gap-6">
+          <Link href={'/'}>
+            {/* Usa el componente Image para mostrar tu logo */}
+            <icon className="flex items-center gap-2">
+              <Image src="/img/logo.png" alt="Logo" width={150} height={70} />
+            </icon>
+          </Link>
+          <nav className="flex items-center gap-4 text-slate-500 text-sm">
+            <Link href={'/about'}>About</Link>
+            <Link href={'/pricing'}>Pricing</Link>
+            <Link href={'/api-services'}>API services</Link>
+            <Link href={'/contact'}>Contact</Link>
+          </nav>
+        </div>
+        <nav className="flex items-center gap-4 text-sm text-slate-500">
+          {!!session && (
+            <>
+              <Link href={'/account'}>
+                Hello, {session?.user?.name}
+              </Link>
+              <LogoutButton />
+            </>
+          )}
+          {!session && (
+            <>
+              <Link href={'/login'}>Sign In</Link>
+              <Link href={'/signup'}>Create Account</Link>
+            </>
+          )}
+        </nav>
+      </div>
+    </header>
+  );
+}
+
+
+// Archivo: /home/user/linkeep/src/components/PaymentComponent/PaymentComponent.js
+// components/PaymentComponent.jsx
+'use client'
+
+import { useState } from 'react';
+import { PayPalScriptProvider, PayPalButtons } from '@paypal/react-paypal-js';
+
+const PaymentComponent = ({ userId }) => {
+  const [amount, setAmount] = useState(1);
+  const [credits, setCredits] = useState(100);
+
+  const createOrder = async (data, actions) => {
+    const res = await fetch('/api/credits', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ amount, userId }),
+    });
+    const order = await res.json();
+    console.log(order);
+    return order.id;
+  };
+
+  const onApprove = async (data, actions) => {
+    console.log('Approved:', data);
+    await actions.order.capture();
+  };
+
+  const onCancel = (data) => {
+    console.log('Cancelled:', data);
+  };
+
+  const handleAmountChange = (e) => {
+    const newAmount = parseInt(e.target.value);
+    setAmount(newAmount);
+    setCredits(newAmount * 100);
+  };
+
+  return (
+    <div className="h-screen bg-slate-900 flex flex-col items-center justify-center">
+      <div className="mb-4">
+        <label htmlFor="amount" className="text-white mr-2">
+          Payment Amount:
+        </label>
+        <input
+          type="number"
+          id="amount"
+          value={amount}
+          onChange={handleAmountChange}
+          className="px-2 py-1 rounded-md"
+          step="0.01"
+          min="0"
+        />
+      </div>
+      <div className="mb-8 text-white">Credits to Obtain: {credits}</div>
+      <PayPalScriptProvider
+        options={{ clientId: process.env.NEXT_PUBLIC_PAYPAL_CLIENT_ID }}
+      >
+        <PayPalButtons
+          style={{ layout: 'vertical', color: 'silver' }}
+          createOrder={createOrder}
+          onApprove={onApprove}
+          onCancel={onCancel}
+        />
+      </PayPalScriptProvider>
+    </div>
+  );
+};
+
+export default PaymentComponent;
+
+// Archivo: /home/user/linkeep/src/components/buttons/LoginWithGoogle.js
+'use client';
+import {faGoogle} from "@fortawesome/free-brands-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+import {signIn} from "next-auth/react";
+
+export default function LoginWithGoogle() {
+  return (
+    <button
+      onClick={() => signIn('google')}
+      className="bg-white shadow text-center w-full py-4 flex gap-3 items-center justify-center">
+      <FontAwesomeIcon icon={faGoogle} className="h-6" />
+      <span>Sign In with Google</span>
+    </button>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/buttons/LogoutButton.js
+'use client';
+import {faRightFromBracket} from "@fortawesome/free-solid-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+import {signOut} from "next-auth/react";
+
+export default function LogoutButton({
+  className = 'flex items-center gap-2 border p-2 px-4 shadow',
+  iconLeft = false,
+  iconClasses = '',
+}) {
+  return (
+    <button
+      className={className}
+      onClick={() => signOut()}>
+      {iconLeft && (
+        <FontAwesomeIcon icon={faRightFromBracket} className={iconClasses} />
+      )}
+      <span>Logout</span>
+      {!iconLeft && (
+        <FontAwesomeIcon icon={faRightFromBracket} className={iconClasses} />
+      )}
+    </button>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/buttons/SubmitButton.js
+import {useFormStatus} from 'react-dom';
+
+export default function SubmitButton({children, className=''}) {
+  const {pending} = useFormStatus();
+  return (
+    <button
+      type="submit"
+      disabled={pending}
+      className={"bg-blue-500 disabled:bg-blue-400 text-white disabled:text-gray-200 py-2 px-4 block mx-auto w-full flex gap-2 items-center justify-center " + className}
+    >
+      {pending && (
+        <span>Saving...</span>
+      )}
+      {!pending && children}
+    </button>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/formItems/radioTogglers.js
+import {faImage, faPalette} from "@fortawesome/free-solid-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+
+export default function RadioTogglers({options,defaultValue,onChange}) {
+  return (
+    <div className="radio-togglers shadow">
+      {options.map(option => (
+        <label key={option.value}>
+          <input
+            type="radio"
+            name="bgType"
+            onClick={ev => onChange(ev.target.value)}
+            defaultChecked={defaultValue === option.value}
+            value={option.value}/>
+          <div>
+            <FontAwesomeIcon icon={option.icon} />
+            <span>{option.label}</span>
+          </div>
+        </label>
+      ))}
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/formResults/UsernameFormResult.js
+export default function UsernameFormResult() {
+  return (
+    <div className="bg-red-200 border border-red-500 p-2 mb-2 text-center">
+      Taken username
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/forms/ApiDashboard.js
+
+
+
+// Archivo: /home/user/linkeep/src/components/forms/HeroForm.js
+'use client';
+
+import {signIn} from "next-auth/react";
+import {redirect, useRouter} from "next/navigation";
+import {useEffect} from "react";
+
+export default function HeroForm({user}) {
+  const router = useRouter();
+  useEffect(() => {
+    if (
+      'localStorage' in window
+      && window.localStorage.getItem('desiredUsername')
+    ) {
+      const username = window.localStorage.getItem('desiredUsername');
+      window.localStorage.removeItem('desiredUsername');
+      redirect('/account?desiredUsername=' + username);
+    }
+  }, []);
+  async function handleSubmit(ev) {
+    ev.preventDefault();
+    const form = ev.target;
+    const input = form.querySelector('input');
+    const username = input.value;
+    if (username.length > 0) {
+      if (user) {
+        router.push('/account?desiredUsername='+username);
+      } else {
+        window.localStorage.setItem('desiredUsername', username);
+        await signIn('google');
+      }
+    }
+  }
+  return (
+    <form
+      onSubmit={handleSubmit}
+      className="inline-flex items-center shadow-lg bg-white shadow-gray-500/20">
+          <span className="bg-white py-4 pl-4">
+            linkeep.co/
+          </span>
+      <input
+        type="text"
+        className=""
+        style={{backgroundColor:'white',marginBottom:0,paddingLeft:0}}
+        placeholder="username"/>
+      <button
+        type="submit"
+        className="bg-blue-500 text-white py-4 px-6 whitespace-nowrap">
+        Join for Free
+      </button>
+    </form>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/forms/PageButtonsForm.js
+'use client';
+
+import {savePageButtons} from "@/actions/pageActions";
+import SubmitButton from "@/components/buttons/SubmitButton";
+import SectionBox from "@/components/layout/SectionBox";
+import { ReactSortable } from "react-sortablejs";
+import {
+  faDiscord,
+  faFacebook,
+  faGithub, faInstagram, faInstagramSquare, faTelegram,
+  faTiktok,
+  faWhatsapp,
+  faYoutube
+} from "@fortawesome/free-brands-svg-icons";
+import {faEnvelope, faGripLines, faMobile, faPlus, faSave, faTrash} from "@fortawesome/free-solid-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+import {useState} from "react";
+import toast from "react-hot-toast";
+
+export const allButtons = [
+  {key: 'email', 'label': 'e-mail', icon: faEnvelope, placeholder: 'test@example.com'},
+  {key: 'mobile', 'label': 'mobile', icon: faMobile, placeholder: '+46 123 123 123'},
+  {key: 'instagram', 'label': 'instagram', icon: faInstagram, placeholder: 'https://facebook.com/profile/...'},
+  {key: 'facebook', 'label': 'facebook', icon: faFacebook},
+  {key: 'discord', 'label': 'discord', icon: faDiscord},
+  {key: 'tiktok', 'label': 'tiktok', icon: faTiktok},
+  {key: 'youtube', 'label': 'youtube', icon: faYoutube},
+  {key: 'whatsapp', 'label': 'whatsapp', icon: faWhatsapp},
+  {key: 'github', 'label': 'github', icon: faGithub},
+  {key: 'telegram', 'label': 'telegram', icon: faTelegram},
+];
+
+function upperFirst(str) {
+  return str.slice(0,1).toUpperCase() + str.slice(1);
+}
+
+export default function PageButtonsForm({user,page}) {
+
+  // Asegúrate de que page.buttons es un objeto antes de llamar a Object.keys
+  const pageSavedButtonsKeys = Object.keys(page.buttons || {});
+  const pageSavedButtonsInfo = pageSavedButtonsKeys
+    .map(k => allButtons.find(b => b.key === k));
+  const [activeButtons, setActiveButtons] = useState(pageSavedButtonsInfo);
+
+  function addButtonToProfile(button) {
+    setActiveButtons(prevButtons => {
+      return [...prevButtons, button];
+    });
+  }
+
+  async function saveButtons(formData) {
+    await savePageButtons(formData);
+    toast.success('Settings saved!');
+  }
+
+  function removeButton({key:keyToRemove}) {
+    setActiveButtons(prevButtons => {
+      return prevButtons
+        .filter(button => button.key !== keyToRemove);
+    });
+  }
+
+  const availableButtons = allButtons.filter(b1 => !activeButtons.find(b2 => b1.key === b2.key));
+
+  return (
+    <SectionBox>
+      <form action={saveButtons}>
+        <h2 className="text-2xl font-bold mb-4">Buttons</h2>
+        <ReactSortable
+          handle=".handle"
+          list={activeButtons}
+          setList={setActiveButtons}>
+          {activeButtons.map(b => (
+            <div key={b.key} className="mb-4 md:flex items-center">
+              <div className="w-56 flex h-full text-gray-700 p-2 gap-2 items-center">
+                <FontAwesomeIcon
+                  icon={faGripLines}
+                  className="cursor-pointer text-gray-400 handle p-2" />
+                <FontAwesomeIcon icon={b.icon} />
+                <span>{upperFirst(b.label)}:</span>
+              </div>
+              <div className="grow flex">
+                <input
+                  placeholder={b.placeholder}
+                  name={b.key}
+                  defaultValue={page.buttons[b.key]}
+                  type="text" style={{marginBottom:'0'}} />
+                <button
+                  onClick={() => removeButton(b)}
+                  type="button"
+                  className="py-2 px-4  bg-gray-300 cursor-pointer">
+                  <FontAwesomeIcon icon={faTrash} />
+                </button>
+              </div>
+            </div>
+          ))}
+        </ReactSortable>
+        <div className="flex flex-wrap gap-2 mt-4 border-y py-4">
+          {availableButtons.map(b => (
+            <button
+              key={b.key}
+              type="button"
+              onClick={() => addButtonToProfile(b)}
+              className="flex items-center gap-1 p-2 bg-gray-200">
+              <FontAwesomeIcon icon={b.icon} />
+              <span className="">
+                {upperFirst(b.label)}
+              </span>
+              <FontAwesomeIcon icon={faPlus} />
+            </button>
+          ))}
+        </div>
+        <div className="max-w-xs mx-auto mt-8">
+          <SubmitButton>
+            <FontAwesomeIcon icon={faSave} />
+            <span>Save</span>
+          </SubmitButton>
+        </div>
+      </form>
+    </SectionBox>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/forms/PageLinksForm.js
+'use client';
+import {savePageLinks} from "@/actions/pageActions";
+import SubmitButton from "@/components/buttons/SubmitButton";
+import SectionBox from "@/components/layout/SectionBox";
+import {upload} from "@/libs/upload";
+import {faCloudArrowUp, faGripLines, faLink, faPlus, faSave, faTrash} from "@fortawesome/free-solid-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+import Image from "next/image";
+import {useState} from "react";
+import toast from "react-hot-toast";
+import {ReactSortable} from "react-sortablejs";
+
+export default function PageLinksForm({page,user}) {
+  const [links,setLinks] = useState(page.links || []);
+  async function save() {
+    await savePageLinks(links);
+    toast.success('Saved!');
+  }
+  function addNewLink() {
+    setLinks(prev => {
+      return [...prev, {
+        key: Date.now().toString(),
+        title:'',
+        subtitle:'',
+        icon:'',
+        url:'',
+      }];
+    });
+  }
+  function handleUpload(ev, linkKeyForUpload) {
+    upload(ev, uploadedImageUrl => {
+      setLinks(prevLinks => {
+        const newLinks = [...prevLinks];
+        newLinks.forEach((link,index) => {
+          if (link.key === linkKeyForUpload) {
+            link.icon = uploadedImageUrl;
+          }
+        });
+        return newLinks;
+      });
+    });
+  }
+  function handleLinkChange(keyOfLinkToChange, prop, ev) {
+    setLinks(prev => {
+      const newLinks = [...prev];
+      newLinks.forEach((link) => {
+        if (link.key === keyOfLinkToChange) {
+          link[prop] = ev.target.value;
+        }
+      });
+      return [...prev];
+    })
+  }
+  function removeLink(linkKeyToRemove) {
+    setLinks(prevLinks =>
+      [...prevLinks].filter(l => l.key !== linkKeyToRemove)
+    );
+  }
+  return (
+    <SectionBox>
+      <form action={save}>
+        <h2 className="text-2xl font-bold mb-4">Links</h2>
+        <button
+          onClick={addNewLink}
+          type="button"
+          className="text-blue-500 text-lg flex gap-2 items-center cursor-pointer">
+          <FontAwesomeIcon className="bg-blue-500 text-white p-1 rounded-full aspect-square" icon={faPlus} />
+          <span>Add new</span>
+        </button>
+        <div className="">
+          <ReactSortable
+            handle={'.handle'}
+            list={links} setList={setLinks}>
+            {links.map(l => (
+              <div key={l.key} className="mt-8 md:flex gap-6 items-center">
+                <div className="handle">
+                  <FontAwesomeIcon
+                    className="text-gray-500 mr-2 cursor-ns-resize"
+                    icon={faGripLines} />
+                </div>
+                <div className="text-center">
+                  <div className="bg-gray-300 inline-block relative aspect-square overflow-hidden w-16 h-16 inline-flex justify-center items-center">
+                    {l.icon && (
+                      <Image
+                        className="w-full h-full object-cover"
+                        src={l.icon}
+                        alt={'icon'}
+                        width={64} height={64} />
+                    )}
+                    {!l.icon && (
+                      <FontAwesomeIcon size="xl" icon={faLink} />
+                    )}
+                  </div>
+                  <div>
+                    <input
+                      onChange={ev => handleUpload(ev,l.key)}
+                      id={'icon'+l.key}
+                      type="file"
+                      className="hidden"/>
+                    <label htmlFor={'icon'+l.key} className="border mt-2 p-2 flex items-center gap-1 text-gray-600 cursor-pointer mb-2 justify-center">
+                      <FontAwesomeIcon icon={faCloudArrowUp} />
+                      <span>Change icon</span>
+                    </label>
+                    <button
+                      onClick={() => removeLink(l.key)}
+                      type="button" className="w-full bg-gray-300 py-2 px-3 mb-2 h-full flex gap-2 items-center justify-center">
+                      <FontAwesomeIcon icon={faTrash} />
+                      <span>Remove this link</span>
+                    </button>
+                  </div>
+                </div>
+                <div className="grow">
+                  <label className="input-label">Title:</label>
+                  <input
+                    value={l.title}
+                    onChange={ev => handleLinkChange(l.key, 'title', ev)}
+                    type="text" placeholder="title"/>
+                  <label className="input-label">Subtitle:</label>
+                  <input
+                    value={l.subtitle}
+                    onChange={ev => handleLinkChange(l.key, 'subtitle', ev)}
+                    type="text" placeholder="subtitle (optional)"/>
+                  <label className="input-label">URL:</label>
+                  <input
+                    value={l.url}
+                    onChange={ev => handleLinkChange(l.key, 'url', ev)}
+                    type="text" placeholder="url"/>
+                </div>
+              </div>
+            ))}
+          </ReactSortable>
+        </div>
+        <div className="border-t pt-4 mt-4">
+          <SubmitButton className="max-w-xs mx-auto">
+            <FontAwesomeIcon icon={faSave} />
+            <span>Save</span>
+          </SubmitButton>
+        </div>
+      </form>
+    </SectionBox>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/forms/PageSettingsForm.js
+'use client';
+import {savePageSettings} from "@/actions/pageActions";
+import SubmitButton from "@/components/buttons/SubmitButton";
+import RadioTogglers from "@/components/formItems/radioTogglers";
+import SectionBox from "@/components/layout/SectionBox";
+import {upload} from "@/libs/upload";
+import {faCloudArrowUp, faImage, faPalette, faSave, faUpload} from "@fortawesome/free-solid-svg-icons";
+import {FontAwesomeIcon} from "@fortawesome/react-fontawesome";
+import Image from "next/image";
+import {useState} from "react";
+import toast from "react-hot-toast";
+
+
+export default function PageSettingsForm({page,user}) {
+  const [bgType, setBgType] = useState(page.bgType);
+  const [bgColor, setBgColor] = useState(page.bgColor);
+  const [bgImage, setBgImage] = useState(page.bgImage);
+  const [avatar, setAvatar] = useState(user?.image);
+  async function saveBaseSettings(formData) {
+    const result = await savePageSettings(formData);
+    if (result) {
+      toast.success('Saved!');
+    }
+  }
+
+  async function handleCoverImageChange(ev) {
+    await upload(ev, link => {
+      setBgImage(link);
+    });
+  }
+  async function handleAvatarImageChange(ev) {
+    await upload(ev, link => {
+      setAvatar(link);
+    });
+  }
+  return (
+    <div>
+      <SectionBox>
+        <form action={saveBaseSettings}>
+          <div
+            className="py-4 -m-4 min-h-[300px] flex justify-center items-center bg-cover bg-center"
+            style={
+              bgType === 'color'
+                ? {backgroundColor:bgColor}
+                : {backgroundImage:`url(${bgImage})`}
+            }
+          >
+            <div>
+              <RadioTogglers
+                defaultValue={page.bgType}
+                options={[
+                  {value:'color', icon: faPalette, label: 'Color'},
+                  {value:'image', icon: faImage, label: 'Image'},
+                ]}
+                onChange={val => setBgType(val)}
+              />
+              {bgType === 'color' && (
+                <div className="bg-gray-200 shadow text-gray-700 p-2 mt-2">
+                  <div className="flex gap-2 justify-center">
+                    <span>Background color:</span>
+                    <input
+                      type="color"
+                      name="bgColor"
+                      onChange={ev => setBgColor(ev.target.value)}
+                      defaultValue={page.bgColor} />
+                  </div>
+                </div>
+              )}
+              {bgType === 'image' && (
+                <div className="flex justify-center">
+                  <label
+                    className="bg-white shadow px-4 py-2 mt-2 flex gap-2"
+                  >
+                    <input type="hidden" name="bgImage" value={bgImage}/>
+                    <input
+                      type="file"
+                      onChange={handleCoverImageChange}
+                      className="hidden"/>
+                    <div className="flex gap-2 items-center cursor-pointer">
+                      <FontAwesomeIcon
+                        icon={faCloudArrowUp}
+                        className="text-gray-700" />
+                      <span>Change image</span>
+                    </div>
+                  </label>
+                </div>
+              )}
+            </div>
+          </div>
+          <div className="flex justify-center -mb-12">
+            <div className="relative -top-8 w-[128px] h-[128px]">
+              <div className="overflow-hidden h-full rounded-full border-4 border-white shadow shadow-black/50">
+                <Image
+                  className="w-full h-full object-cover"
+                  src={avatar}
+                  alt={'avatar'}
+                  width={128} height={128} />
+              </div>
+              <label
+                htmlFor="avatarIn"
+                className="absolute bottom-0 -right-2 bg-white p-2 rounded-full shadow shadow-black/50 aspect-square flex items-center cursor-pointer">
+                <FontAwesomeIcon size={'xl'} icon={faCloudArrowUp} />
+              </label>
+              <input onChange={handleAvatarImageChange} id="avatarIn" type="file" className="hidden"/>
+              <input type="hidden" name="avatar" value={avatar}/>
+            </div>
+          </div>
+          <div className="p-0">
+            <label className="input-label" htmlFor="nameIn">Display name</label>
+            <input
+              type="text"
+              id="nameIn"
+              name="displayName"
+              defaultValue={page.displayName}
+              placeholder="John Doe"/>
+            <label className="input-label" htmlFor="locationIn">Location</label>
+            <input
+              type="text"
+              id="locationIn"
+              name="location"
+              defaultValue={page.location}
+              placeholder="Somewhere in the world"/>
+            <label className="input-label" htmlFor="bioIn">Bio</label>
+            <textarea
+              name="bio"
+              defaultValue={page.bio}
+              id="bioIn"
+              placeholder="Your bio goes here..." />
+            <div className="max-w-[200px] mx-auto">
+              <SubmitButton>
+                <FontAwesomeIcon icon={faSave} />
+                <span>Save</span>
+              </SubmitButton>
+            </div>
+          </div>
+        </form>
+      </SectionBox>
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/forms/UsernameForm.js
+'use client';
+import grabUsername from "@/actions/grabUsername";
+import SubmitButton from "@/components/buttons/SubmitButton";
+import RightIcon from "@/components/icons/RightIcon";
+import {redirect} from "next/navigation";
+import {useState} from "react";
+
+export default function UsernameForm({desiredUsername}) {
+  const [taken,setTaken] = useState(false);
+  async function handleSubmit(formData) {
+    const result = await grabUsername(formData);
+
+    setTaken(result === false);
+    if (result) {
+      redirect('/account?created='+formData.get('username'));
+    }
+  }
+  return (
+    <form action={handleSubmit}>
+      <h1 className="text-4xl font-bold text-center mb-2">
+        Grab your username
+      </h1>
+      <p className="text-center mb-6 text-gray-500">
+        Choose your username
+      </p>
+      <div className="max-w-xs mx-auto">
+        <input
+          name="username"
+          className="block p-2 mx-auto border w-full mb-2 text-center"
+          defaultValue={desiredUsername}
+          type="text"
+          placeholder="username" />
+        {taken && (
+          <div className="bg-red-200 border border-red-500 p-2 mb-2 text-center">
+            This username is taken
+          </div>
+        )}
+        <SubmitButton>
+          <span>Claim your username</span>
+          <RightIcon />
+        </SubmitButton>
+      </div>
+    </form>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/icons/RightIcon.js
+export default function RightIcon({className="w-6 h-6"}) {
+  return (
+    <svg xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24" strokeWidth={1.5} stroke="currentColor" className={className}>
+      <path strokeLinecap="round" strokeLinejoin="round" d="M13.5 4.5L21 12m0 0l-7.5 7.5M21 12H3" />
+    </svg>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/components/layout/AppSidebar.js
+'use client';
+import LogoutButton from "@/components/buttons/LogoutButton";
+import { FaFileAlt, FaChartLine, FaArrowLeft, FaKey } from "react-icons/fa";
+import Link from "next/link";
+import { usePathname } from "next/navigation";
+
+export default function AppSidebar() {
+  const path = usePathname();
+  return (
+    <nav className="inline-flex mx-auto flex-col text-center mt-8 gap-2 text-gray-500">
+      <Link
+        href={'/account'}
+        className={
+          "flex gap-4 p-2 "
+          + (path === '/account' ? 'text-blue-500' : '')
+        }>
+        <FaFileAlt className={'w-6 h-6'} />
+        <span>My Page</span>
+      </Link>
+      <Link
+        href={'/analytics'}
+        className={
+          "flex gap-4 p-2 "
+          + (path === '/analytics' ? 'text-blue-500' : '')
+        }>
+        <FaChartLine className={'w-6 h-6'} />
+        <span>Analytics</span>
+      </Link>
+      <Link
+        href={'/api-dashboard'}
+        className={
+          "flex gap-4 p-2 "
+          + (path === '/api-dashboard' ? 'text-blue-500' : '')
+        }>
+        <FaKey className={'w-6 h-6'} />
+        <span>API Keys</span>
+      </Link>
+      <LogoutButton
+        iconLeft={true}
+        className={'flex gap-4 items-center text-gray-500 p-2'}
+        iconClasses={'w-6 h-6'}
+      />
+      <Link href={'/'} className="flex items-center gap-2 text-xs text-gray-500 border-t pt-4">
+        <FaArrowLeft className={'w-3 h-3'} />
+        <span>Back to website</span>
+      </Link>
+    </nav>
+  );
+}
+
+
+// Archivo: /home/user/linkeep/src/components/layout/SectionBox.js
+export default function SectionBox({children}) {
+  return (
+    <div className="bg-white m-8 p-4 shadow">
+      {children}
+    </div>
+  );
+}
+
+// Archivo: /home/user/linkeep/src/libs/auth.js
+
+
+
+// Archivo: /home/user/linkeep/src/libs/mongoClient.js
+// This approach is taken from https://github.com/vercel/next.js/tree/canary/examples/with-mongodb
+import { MongoClient } from "mongodb"
+
+if (!process.env.MONGO_URI) {
+  throw new Error('Invalid/Missing environment variable: "MONGODB_URI"')
+}
+
+const uri = process.env.MONGO_URI
+const options = {}
+
+let client
+let clientPromise
+
+if (process.env.NODE_ENV === "development") {
+  // In development mode, use a global variable so that the value
+  // is preserved across module reloads caused by HMR (Hot Module Replacement).
+  if (!global._mongoClientPromise) {
+    client = new MongoClient(uri, options)
+    global._mongoClientPromise = client.connect()
+  }
+  clientPromise = global._mongoClientPromise
+} else {
+  // In production mode, it's best to not use a global variable.
+  client = new MongoClient(uri, options)
+  clientPromise = client.connect()
+}
+
+// Export a module-scoped MongoClient promise. By doing this in a
+// separate module, the client can be shared across functions.
+export default clientPromise
+
+// Archivo: /home/user/linkeep/src/libs/upload.js
+import toast from "react-hot-toast";
+
+export async function upload(ev, callbackFn) {
+  const file = ev.target.files?.[0];
+
+  if (file) {
+
+    const uploadPromise = new Promise((resolve, reject) => {
+      const data = new FormData;
+      data.set('file', file);
+      fetch('/api/upload', {
+        method: 'POST',
+        body: data,
+      }).then(response => {
+        if (response.ok) {
+          response.json().then(link => {
+            callbackFn(link);
+            resolve(link);
+          });
+        } else {
+          reject();
+        }
+      });
+    });
+
+    await toast.promise(uploadPromise, {
+      loading: 'Uploading...',
+      success: 'Uploaded!',
+      error: 'Upload error!',
+    });
+
+  }
+}
+
+// Archivo: /home/user/linkeep/src/models/Event.js
+import {model, models, Schema} from "mongoose";
+
+const EventSchema = new Schema({
+  type: String, // click or view
+  page: String, // for example "dawid"
+  uri: String, // /dawid | https://
+}, {timestamps: true});
+
+export const Event = models?.Event || model('Event', EventSchema);
+
+// Archivo: /home/user/linkeep/src/models/Page.js
+import {model, models, Schema} from "mongoose";
+
+const PageSchema = new Schema({
+  uri: {type: String, required: true, min: 1, unique: true},
+  owner: {type: String, required: true},
+  displayName: {type: String, default: ''},
+  location: {type: String, default: ''},
+  bio: {type: String, default: ''},
+  bgType: {type: String, default: 'color'},
+  bgColor: {type: String, default: '#000'},
+  bgImage: {type: String, default: ''},
+  buttons: {type: Object, default: {}},
+  links: {type: Object, default: []},
+}, {timestamps: true});
+
+export const Page = models?.Page || model('Page', PageSchema);
+
+// Archivo: /home/user/linkeep/src/models/User.js
+import {model, models, Schema} from "mongoose";
+
+const UserSchema = new Schema({
+  name: String,
+  email: String,
+  image: String,
+  emailVerified: Date,
+
+});
+
+export const User = models?.User || model('User', UserSchema);
+
+// Archivo: /home/user/linkeep/src/models/credit.js
+// models/Credit.js
+import mongoose from 'mongoose';
+
+const creditSchema = new mongoose.Schema({
+  userId: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  amount: { type: Number, required: true },
+  createdAt: { type: Date, default: Date.now },
+});
+
+export default mongoose.models.Credit || mongoose.model('Credit', creditSchema);
+
+// Archivo: /home/user/linkeep/tailwind.config.js
+/** @type {import('tailwindcss').Config} */
+module.exports = {
+  content: [
+    './src/pages/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/components/**/*.{js,ts,jsx,tsx,mdx}',
+    './src/app/**/*.{js,ts,jsx,tsx,mdx}',
+  ],
+  theme: {
+    extend: {
+      backgroundImage: {
+        'gradient-radial': 'radial-gradient(var(--tw-gradient-stops))',
+        'gradient-conic':
+          'conic-gradient(from 180deg at 50% 50%, var(--tw-gradient-stops))',
+      },
+    },
+  },
+  plugins: [],
+}
+
+
